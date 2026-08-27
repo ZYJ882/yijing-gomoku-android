@@ -87,6 +87,15 @@ class GomokuAi {
         val workingBoard = board.copyOf()
         openingBookMove(workingBoard, player)?.let { return AiResult(it, 0, searchedNodes) }
 
+        rootImmediateWinningMove(workingBoard, player)?.let {
+            return AiResult(it, 0, searchedNodes)
+        }
+
+        val enemy = GomokuRules.opponent(player)
+        rootImmediateWinningMove(workingBoard, enemy)?.let { block ->
+            return AiResult(Move(block.row, block.col, player), 0, searchedNodes)
+        }
+
         val initialHash = computeHash(workingBoard)
         val allCandidates = orderedCandidates(
             board = workingBoard,
@@ -95,15 +104,6 @@ class GomokuAi {
             hash = initialHash,
         )
         val fallback = allCandidates.firstOrNull() ?: ScoredMove(BOARD_SIZE / 2, BOARD_SIZE / 2, 0)
-
-        immediateWinningMove(workingBoard, player, allCandidates)?.let {
-            return AiResult(it, 0, searchedNodes)
-        }
-
-        val enemy = GomokuRules.opponent(player)
-        immediateWinningMove(workingBoard, enemy, allCandidates)?.let { block ->
-            return AiResult(Move(block.row, block.col, player), 0, searchedNodes)
-        }
 
         // 高难度优先进行强制杀棋；超时则直接退回常规 PVS，绝不影响本次落子返回。
         if (difficulty != AiDifficulty.EASY && difficulty != AiDifficulty.NORMAL) {
@@ -417,6 +417,14 @@ class GomokuAi {
      * VCF（连续冲四）子集搜索。每一步攻击后只接受：直接成五、产生两个成五点，
      * 或产生唯一成五点且对手没有立即反杀；后一种情况下防守方被迫占据该唯一点。
      */
+    /** 根节点直接调用 NDK 扫描；JVM 测试与异常设备会使用语义等价的 Kotlin 实现。 */
+    private fun rootImmediateWinningMove(board: IntArray, player: Int): Move? {
+        val winningIndices = NativeTacticalScanner.winningMoveIndices(board, player)
+            ?: NativeTacticalScanner.kotlinWinningMoveIndices(board, player)
+        val index = winningIndices.firstOrNull() ?: return null
+        return Move(index / BOARD_SIZE, index % BOARD_SIZE, player)
+    }
+
     private fun findVcfWinningMove(
         board: IntArray,
         attacker: Int,
