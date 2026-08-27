@@ -83,4 +83,40 @@ class GomokuCoreTest {
             (result.move.row == 8 && result.move.col == 2) || (result.move.row == 8 && result.move.col == 7),
         )
     }
+
+    @Test
+    fun `ai fills the gap of a broken four to win immediately`() {
+        val board = GomokuRules.createBoard()
+        listOf(3, 4, 6, 7).forEach { col -> board[GomokuRules.index(7, col)] = WHITE }
+        board[GomokuRules.index(6, 6)] = BLACK
+
+        val result = GomokuAi().chooseMove(board, WHITE, AiDifficulty.HARD)
+
+        assertEquals(Move(7, 5, WHITE), result.move)
+    }
+
+    @Test
+    fun `ai blocks the gap of an opponent broken four`() {
+        val board = GomokuRules.createBoard()
+        listOf(3, 4, 6, 7).forEach { col -> board[GomokuRules.index(7, col)] = BLACK }
+        board[GomokuRules.index(6, 6)] = WHITE
+
+        val result = GomokuAi().chooseMove(board, WHITE, AiDifficulty.HARD)
+
+        assertEquals(Move(7, 5, WHITE), result.move)
+    }
+
+    @Test
+    fun `hard ai starts an open four double threat`() {
+        val board = GomokuRules.createBoard()
+        listOf(4, 5, 6).forEach { col -> board[GomokuRules.index(7, col)] = WHITE }
+        board[GomokuRules.index(6, 5)] = BLACK
+
+        val result = GomokuAi().chooseMove(board, WHITE, AiDifficulty.HARD)
+
+        assertTrue(
+            "AI 应走出开放四，制造两端均可成五的双威胁",
+            result.move.row == 7 && (result.move.col == 3 || result.move.col == 7),
+        )
+    }
 }
