@@ -119,4 +119,18 @@ class GomokuCoreTest {
             result.move.row == 7 && (result.move.col == 3 || result.move.col == 7),
         )
     }
+
+    @Test
+    fun `hard ai blocks an opponent open four double threat`() {
+        val board = GomokuRules.createBoard()
+        listOf(4, 5, 6).forEach { col -> board[GomokuRules.index(7, col)] = BLACK }
+        board[GomokuRules.index(6, 5)] = WHITE
+
+        val result = GomokuAi().chooseMove(board, WHITE, AiDifficulty.HARD)
+
+        assertTrue(
+            "AI 应抢占黑棋形成开放四的任一关键点",
+            result.move.row == 7 && (result.move.col == 3 || result.move.col == 7),
+        )
+    }
 }

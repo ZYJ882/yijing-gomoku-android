@@ -17,8 +17,8 @@ import kotlin.random.Random
 /**
  * 面向移动端的专项五子棋引擎。
  *
- * 搜索顺序：立即胜负 -> VCF 强迫威胁 -> 迭代加深 Alpha-Beta。
- * 评估使用方向模式表，置换表保存精确值或 Alpha/Beta 上下界，避免将剪枝值误作精确值复用。
+ * 搜索顺序：立即胜负 -> VCF 强迫威胁 -> 迭代加深主变化搜索（PVS）。
+ * 评估使用方向模式码表缓存；置换表保存精确值或 Alpha/Beta 上下界，避免将剪枝值误作精确值复用。
  */
 class GomokuAi {
     private data class ScoredMove(val row: Int, val col: Int, val score: Int)
@@ -52,6 +52,9 @@ class GomokuAi {
     private val candidateKey = 5443911996627931537L
     private val transposition = HashMap<Long, TranspositionEntry>(MAX_TRANSPOSITION_ENTRIES)
     private val candidateCache = HashMap<Long, List<ScoredMove>>(MAX_CANDIDATE_CACHE_ENTRIES)
+    private val patternCodeCache = HashMap<Int, LineThreat>(MAX_PATTERN_CACHE_ENTRIES)
+    private val killerMoves = IntArray(MAX_SEARCH_DEPTH) { -1 }
+    private val history = IntArray(BOARD_CELLS * 2)
 
     private var aiPlayer = WHITE
     private var deadlineNanos = 0L
@@ -70,6 +73,8 @@ class GomokuAi {
         searchedNodes = 0
         transposition.clear()
         candidateCache.clear()
+        killerMoves.fill(-1)
+        history.fill(0)
         deadlineNanos = System.nanoTime() + difficulty.timeBudgetMs * 1_000_000L
 
         val workingBoard = board.copyOf()
@@ -96,7 +101,7 @@ class GomokuAi {
             findVcfWinningMove(
                 board = workingBoard,
                 attacker = player,
-                attackPlies = if (difficulty == AiDifficulty.MASTER) 3 else 2,
+                attackPlies = if (difficulty == AiDifficulty.MASTER) 4 else 3,
                 candidateLimit = max(16, difficulty.candidateLimit + 4),
             )?.let { return AiResult(it, 0, searchedNodes) }
 
@@ -104,7 +109,7 @@ class GomokuAi {
             findVcfWinningMove(
                 board = workingBoard,
                 attacker = enemy,
-                attackPlies = if (difficulty == AiDifficulty.MASTER) 3 else 2,
+                attackPlies = if (difficulty == AiDifficulty.MASTER) 4 else 3,
                 candidateLimit = max(16, difficulty.candidateLimit + 4),
             )?.let { threat ->
                 if (GomokuRules.isEmpty(workingBoard, threat.row, threat.col)) {
@@ -153,18 +158,24 @@ class GomokuAi {
         var best: ScoredMove? = null
         val key = positionKey(hash, player)
         val hint = transposition[key]?.bestIndex
-        val candidates = orderedCandidates(board, player, candidateLimit, hint, hash)
+        val candidates = orderForSearch(
+            orderedCandidates(board, player, candidateLimit, hint, hash),
+            player = player,
+            depth = depth,
+        )
+        var isFirstMove = true
 
         for (candidate in candidates) {
             ensureSearchActive()
             val boardIndex = GomokuRules.index(candidate.row, candidate.col)
             board[boardIndex] = player
+            val childHash = hash xor zobristKey(boardIndex, player)
             val score = if (GomokuRules.isWinningMove(board, Move(candidate.row, candidate.col, player))) {
                 WIN_SCORE - depth
-            } else {
+            } else if (isFirstMove) {
                 search(
                     board = board,
-                    hash = hash xor zobristKey(boardIndex, player),
+                    hash = childHash,
                     toMove = GomokuRules.opponent(player),
                     depth = depth - 1,
                     alpha = alpha,
@@ -172,8 +183,33 @@ class GomokuAi {
                     lastMove = Move(candidate.row, candidate.col, player),
                     candidateLimit = candidateLimit,
                 )
+            } else {
+                var probe = search(
+                    board = board,
+                    hash = childHash,
+                    toMove = GomokuRules.opponent(player),
+                    depth = depth - 1,
+                    alpha = alpha,
+                    beta = min(beta, alpha + 1),
+                    lastMove = Move(candidate.row, candidate.col, player),
+                    candidateLimit = candidateLimit,
+                )
+                if (probe > alpha && probe < beta) {
+                    probe = search(
+                        board = board,
+                        hash = childHash,
+                        toMove = GomokuRules.opponent(player),
+                        depth = depth - 1,
+                        alpha = alpha,
+                        beta = beta,
+                        lastMove = Move(candidate.row, candidate.col, player),
+                        candidateLimit = candidateLimit,
+                    )
+                }
+                probe
             }
             board[boardIndex] = EMPTY
+            isFirstMove = false
 
             if (score > bestScore) {
                 bestScore = score
@@ -216,6 +252,8 @@ class GomokuAi {
 
         val key = positionKey(hash, toMove)
         val cached = transposition[key]
+        val originalAlpha = alpha
+        val originalBeta = beta
         var localAlpha = alpha
         var localBeta = beta
         if (cached != null && cached.depth >= depth) {
@@ -227,28 +265,83 @@ class GomokuAi {
             if (localAlpha >= localBeta) return cached.score
         }
 
-        val originalAlpha = localAlpha
-        val originalBeta = localBeta
         val maximizing = toMove == aiPlayer
         var bestScore = if (maximizing) -WIN_SCORE else WIN_SCORE
         var bestIndex = -1
-        val candidates = orderedCandidates(board, toMove, candidateLimit, cached?.bestIndex, hash)
+        val candidates = orderForSearch(
+            orderedCandidates(board, toMove, candidateLimit, cached?.bestIndex, hash),
+            player = toMove,
+            depth = depth,
+        )
+        var isFirstMove = true
 
         for (candidate in candidates) {
             ensureSearchActive()
             val boardIndex = GomokuRules.index(candidate.row, candidate.col)
             board[boardIndex] = toMove
-            val score = search(
-                board = board,
-                hash = hash xor zobristKey(boardIndex, toMove),
-                toMove = GomokuRules.opponent(toMove),
-                depth = depth - 1,
-                alpha = localAlpha,
-                beta = localBeta,
-                lastMove = Move(candidate.row, candidate.col, toMove),
-                candidateLimit = candidateLimit,
-            )
+            val childHash = hash xor zobristKey(boardIndex, toMove)
+            val score = if (isFirstMove) {
+                search(
+                    board = board,
+                    hash = childHash,
+                    toMove = GomokuRules.opponent(toMove),
+                    depth = depth - 1,
+                    alpha = localAlpha,
+                    beta = localBeta,
+                    lastMove = Move(candidate.row, candidate.col, toMove),
+                    candidateLimit = candidateLimit,
+                )
+            } else if (maximizing) {
+                var probe = search(
+                    board = board,
+                    hash = childHash,
+                    toMove = GomokuRules.opponent(toMove),
+                    depth = depth - 1,
+                    alpha = localAlpha,
+                    beta = min(localBeta, localAlpha + 1),
+                    lastMove = Move(candidate.row, candidate.col, toMove),
+                    candidateLimit = candidateLimit,
+                )
+                if (probe > localAlpha && probe < localBeta) {
+                    probe = search(
+                        board = board,
+                        hash = childHash,
+                        toMove = GomokuRules.opponent(toMove),
+                        depth = depth - 1,
+                        alpha = localAlpha,
+                        beta = localBeta,
+                        lastMove = Move(candidate.row, candidate.col, toMove),
+                        candidateLimit = candidateLimit,
+                    )
+                }
+                probe
+            } else {
+                var probe = search(
+                    board = board,
+                    hash = childHash,
+                    toMove = GomokuRules.opponent(toMove),
+                    depth = depth - 1,
+                    alpha = max(localAlpha, localBeta - 1),
+                    beta = localBeta,
+                    lastMove = Move(candidate.row, candidate.col, toMove),
+                    candidateLimit = candidateLimit,
+                )
+                if (probe < localBeta && probe > localAlpha) {
+                    probe = search(
+                        board = board,
+                        hash = childHash,
+                        toMove = GomokuRules.opponent(toMove),
+                        depth = depth - 1,
+                        alpha = localAlpha,
+                        beta = localBeta,
+                        lastMove = Move(candidate.row, candidate.col, toMove),
+                        candidateLimit = candidateLimit,
+                    )
+                }
+                probe
+            }
             board[boardIndex] = EMPTY
+            isFirstMove = false
 
             if (maximizing) {
                 if (score > bestScore) {
@@ -263,7 +356,10 @@ class GomokuAi {
                 }
                 localBeta = min(localBeta, bestScore)
             }
-            if (localAlpha >= localBeta) break
+            if (localAlpha >= localBeta) {
+                registerCutoff(toMove, boardIndex, depth)
+                break
+            }
         }
 
         val bound = when {
@@ -429,6 +525,31 @@ class GomokuAi {
         return candidates.sortedByDescending { it.score }
     }
 
+    private fun orderForSearch(
+        candidates: List<ScoredMove>,
+        player: Int,
+        depth: Int,
+    ): List<ScoredMove> {
+        val killer = killerMoves.getOrNull(depth) ?: -1
+        return candidates.sortedByDescending { candidate ->
+            val index = GomokuRules.index(candidate.row, candidate.col)
+            val killerBonus = if (index == killer) KILLER_BONUS else 0
+            val historyBonus = history[index * 2 + playerSlot(player)].coerceAtMost(MAX_HISTORY_BONUS)
+            candidate.score + killerBonus + historyBonus
+        }
+    }
+
+    private fun registerCutoff(player: Int, moveIndex: Int, depth: Int) {
+        if (depth in killerMoves.indices && killerMoves[depth] != moveIndex) {
+            killerMoves[depth] = moveIndex
+        }
+        val historyIndex = moveIndex * 2 + playerSlot(player)
+        history[historyIndex] = (history[historyIndex] + depth * depth * HISTORY_UNIT)
+            .coerceAtMost(MAX_HISTORY_BONUS)
+    }
+
+    private fun playerSlot(player: Int): Int = if (player == BLACK) 0 else 1
+
     private fun hasNeighbor(board: IntArray, row: Int, col: Int): Boolean {
         for (dr in -2..2) {
             for (dc in -2..2) {
@@ -500,18 +621,38 @@ class GomokuAi {
      * 四方向局部模式表。X 表示当前方，. 表示空点，O/# 表示阻断。
      * 模式按威胁强度返回单方向最高等级，避免同一线段被低阶模式重复放大。
      */
-    private fun classifyLine(line: String): LineThreat = when {
-        "XXXXX" in line -> LineThreat(FIVE_SCORE, 5)
-        ".XXXX." in line -> LineThreat(OPEN_FOUR_SCORE, 4)
-        hasAny(line, "XXX.X", "XX.XX", "X.XXX") -> LineThreat(BROKEN_FOUR_SCORE, 4)
-        "XXXX." in line || ".XXXX" in line -> LineThreat(CLOSED_FOUR_SCORE, 4)
-        ".XXX." in line -> LineThreat(OPEN_THREE_SCORE, 3)
-        hasAny(line, ".XX.X.", ".X.XX.", ".X.X.X.") -> LineThreat(BROKEN_THREE_SCORE, 3)
-        "XXX." in line || ".XXX" in line -> LineThreat(CLOSED_THREE_SCORE, 2)
-        ".XX." in line -> LineThreat(OPEN_TWO_SCORE, 2)
-        hasAny(line, ".X.X.", ".X..X.") -> LineThreat(BROKEN_TWO_SCORE, 1)
-        "XX." in line || ".XX" in line -> LineThreat(CLOSED_TWO_SCORE, 1)
-        else -> LineThreat(SINGLE_SCORE, 0)
+    private fun classifyLine(line: String): LineThreat {
+        val code = encodeLine(line)
+        patternCodeCache[code]?.let { return it }
+        val threat = when {
+            "XXXXX" in line -> LineThreat(FIVE_SCORE, 5)
+            ".XXXX." in line -> LineThreat(OPEN_FOUR_SCORE, 4)
+            hasAny(line, "XXX.X", "XX.XX", "X.XXX") -> LineThreat(BROKEN_FOUR_SCORE, 4)
+            "XXXX." in line || ".XXXX" in line -> LineThreat(CLOSED_FOUR_SCORE, 4)
+            ".XXX." in line -> LineThreat(OPEN_THREE_SCORE, 3)
+            hasAny(line, ".XX.X.", ".X.XX.", ".X.X.X.") -> LineThreat(BROKEN_THREE_SCORE, 3)
+            "XXX." in line || ".XXX" in line -> LineThreat(CLOSED_THREE_SCORE, 2)
+            ".XX." in line -> LineThreat(OPEN_TWO_SCORE, 2)
+            hasAny(line, ".X.X.", ".X..X.") -> LineThreat(BROKEN_TWO_SCORE, 1)
+            "XX." in line || ".XX" in line -> LineThreat(CLOSED_TWO_SCORE, 1)
+            else -> LineThreat(SINGLE_SCORE, 0)
+        }
+        if (patternCodeCache.size >= MAX_PATTERN_CACHE_ENTRIES) patternCodeCache.clear()
+        patternCodeCache[code] = threat
+        return threat
+    }
+
+    /** 将局部线段编码为三进制：空点 0、己方 1、阻断点 2。 */
+    private fun encodeLine(line: String): Int {
+        var code = 0
+        for (cell in line) {
+            code = code * 3 + when (cell) {
+                '.' -> 0
+                'X' -> 1
+                else -> 2
+            }
+        }
+        return code
     }
 
     private fun hasAny(line: String, vararg patterns: String): Boolean = patterns.any { it in line }
@@ -562,5 +703,10 @@ class GomokuAi {
         const val CENTER_BONUS = 30
         const val MAX_TRANSPOSITION_ENTRIES = 120_000
         const val MAX_CANDIDATE_CACHE_ENTRIES = 24_000
+        const val MAX_PATTERN_CACHE_ENTRIES = 120_000
+        const val MAX_SEARCH_DEPTH = 16
+        const val KILLER_BONUS = 1_400_000
+        const val HISTORY_UNIT = 1_600
+        const val MAX_HISTORY_BONUS = 1_000_000
     }
 }
