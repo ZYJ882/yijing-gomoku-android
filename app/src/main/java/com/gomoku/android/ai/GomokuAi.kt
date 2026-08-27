@@ -48,6 +48,13 @@ class GomokuAi {
         val disproofNumber: Int,
     )
 
+    private enum class ThreatNode { ATTACK, DEFENSE }
+
+    private data class ThreatCacheEntry(
+        val remainingAttackPlies: Int,
+        val proof: ThreatProof,
+    )
+
     private class SearchAborted : RuntimeException()
 
     private val directions = arrayOf(1 to 0, 0 to 1, 1 to 1, 1 to -1)
@@ -60,6 +67,7 @@ class GomokuAi {
     private val transposition = HashMap<Long, TranspositionEntry>(MAX_TRANSPOSITION_ENTRIES)
     private val candidateCache = HashMap<Long, List<ScoredMove>>(MAX_CANDIDATE_CACHE_ENTRIES)
     private val patternCodeCache = HashMap<Int, LineThreat>(MAX_PATTERN_CACHE_ENTRIES)
+    private val threatCache = HashMap<Long, ThreatCacheEntry>(MAX_THREAT_CACHE_ENTRIES)
     private val killerMoves = IntArray(MAX_SEARCH_DEPTH) { -1 }
     private val history = IntArray(BOARD_CELLS * 2)
 
@@ -80,6 +88,7 @@ class GomokuAi {
         searchedNodes = 0
         transposition.clear()
         candidateCache.clear()
+        threatCache.clear()
         killerMoves.fill(-1)
         history.fill(0)
         deadlineNanos = System.nanoTime() + difficulty.timeBudgetMs * 1_000_000L
@@ -113,14 +122,14 @@ class GomokuAi {
                 val tacticalWidth = max(16, difficulty.candidateLimit + 4)
                 tacticalChoice = findVcfWinningMove(workingBoard, player, attackPlies, tacticalWidth)
                 if (tacticalChoice == null && difficulty == AiDifficulty.MASTER) {
-                    tacticalChoice = findVctWinningMove(workingBoard, player, VCT_ATTACK_PLIES, VCT_ATTACK_WIDTH)
+                    tacticalChoice = findVctWinningMove(workingBoard, initialHash, player, VCT_ATTACK_PLIES, VCT_ATTACK_WIDTH)
                 }
                 if (tacticalChoice == null) {
                     val enemyVcf = findVcfWinningMove(workingBoard, enemy, attackPlies, tacticalWidth)
                     if (enemyVcf != null) tacticalChoice = Move(enemyVcf.row, enemyVcf.col, player)
                 }
                 if (tacticalChoice == null && difficulty == AiDifficulty.MASTER) {
-                    val enemyVct = findVctWinningMove(workingBoard, enemy, VCT_ATTACK_PLIES, VCT_ATTACK_WIDTH)
+                    val enemyVct = findVctWinningMove(workingBoard, initialHash, enemy, VCT_ATTACK_PLIES, VCT_ATTACK_WIDTH)
                     if (enemyVct != null) tacticalChoice = Move(enemyVct.row, enemyVct.col, player)
                 }
             } catch (_: SearchAborted) {
@@ -504,6 +513,7 @@ class GomokuAi {
      */
     private fun findVctWinningMove(
         board: IntArray,
+        hash: Long,
         attacker: Int,
         attackPlies: Int,
         candidateLimit: Int,
@@ -511,7 +521,7 @@ class GomokuAi {
         val attacks = tacticalAttackCandidates(board, attacker, candidateLimit)
         for (attack in attacks) {
             ensureSearchActive()
-            val proof = tryVctAttack(board, attacker, attack, attackPlies - 1, candidateLimit)
+            val proof = tryVctAttack(board, hash, attacker, attack, attackPlies - 1, candidateLimit)
             if (proof.proven) return Move(attack.row, attack.col, attacker)
         }
         return null
@@ -519,26 +529,34 @@ class GomokuAi {
 
     private fun proveVctAttackNode(
         board: IntArray,
+        hash: Long,
         attacker: Int,
         remainingAttackPlies: Int,
         candidateLimit: Int,
     ): ThreatProof {
         if (remainingAttackPlies <= 0) return ThreatProof(false, 1, 0)
+        val key = threatKey(hash, attacker, remainingAttackPlies, ThreatNode.ATTACK)
+        threatCache[key]?.takeIf { it.remainingAttackPlies >= remainingAttackPlies }?.let { return it.proof }
+
         val attacks = tacticalAttackCandidates(board, attacker, candidateLimit)
         var proofNumber = 0
         var disproofNumber = Int.MAX_VALUE
-        for (attack in attacks) {
+        val result = attacks.firstNotNullOfOrNull { attack ->
             ensureSearchActive()
-            val result = tryVctAttack(board, attacker, attack, remainingAttackPlies - 1, candidateLimit)
-            if (result.proven) return ThreatProof(true, 0, 1)
-            proofNumber = saturatingAdd(proofNumber, result.proofNumber)
-            disproofNumber = min(disproofNumber, result.disproofNumber)
-        }
-        return ThreatProof(false, proofNumber.coerceAtLeast(1), disproofNumber.coerceAtLeast(1))
+            val child = tryVctAttack(board, hash, attacker, attack, remainingAttackPlies - 1, candidateLimit)
+            if (child.proven) ThreatProof(true, 0, 1) else {
+                proofNumber = saturatingAdd(proofNumber, child.proofNumber)
+                disproofNumber = min(disproofNumber, child.disproofNumber)
+                null
+            }
+        } ?: ThreatProof(false, proofNumber.coerceAtLeast(1), disproofNumber.coerceAtLeast(1))
+        storeThreatProof(key, remainingAttackPlies, result)
+        return result
     }
 
     private fun tryVctAttack(
         board: IntArray,
+        hash: Long,
         attacker: Int,
         attack: ScoredMove,
         remainingAttackPlies: Int,
@@ -546,6 +564,7 @@ class GomokuAi {
     ): ThreatProof {
         val defender = GomokuRules.opponent(attacker)
         val attackIndex = GomokuRules.index(attack.row, attack.col)
+        val hashAfterAttack = hash xor zobristKey(attackIndex, attacker)
         board[attackIndex] = attacker
 
         val result = when {
@@ -561,6 +580,7 @@ class GomokuAi {
                         board[blockIndex] = defender
                         val continuation = proveVctAttackNode(
                             board,
+                            hashAfterAttack xor zobristKey(blockIndex, defender),
                             attacker,
                             remainingAttackPlies,
                             candidateLimit,
@@ -569,7 +589,14 @@ class GomokuAi {
                         continuation
                     }
                     remainingAttackPlies <= 0 -> ThreatProof(false, 1, 0)
-                    else -> verifyVctDefenses(board, attacker, remainingAttackPlies, candidateLimit, attack)
+                    else -> verifyVctDefenses(
+                        board,
+                        hashAfterAttack,
+                        attacker,
+                        remainingAttackPlies,
+                        candidateLimit,
+                        attack,
+                    )
                 }
             }
         }
@@ -579,28 +606,39 @@ class GomokuAi {
 
     private fun verifyVctDefenses(
         board: IntArray,
+        hashAfterAttack: Long,
         attacker: Int,
         remainingAttackPlies: Int,
         candidateLimit: Int,
         lastAttack: ScoredMove,
     ): ThreatProof {
+        val key = threatKey(hashAfterAttack, attacker, remainingAttackPlies, ThreatNode.DEFENSE)
+        threatCache[key]?.takeIf { it.remainingAttackPlies >= remainingAttackPlies }?.let { return it.proof }
+
         val defender = GomokuRules.opponent(attacker)
         val replies = vctDefensiveCandidates(board, defender, lastAttack, candidateLimit)
         if (replies.isEmpty()) return ThreatProof(false, 1, 0)
 
-        var proofNumber = Int.MAX_VALUE
         var disproofNumber = 0
-        for (reply in replies) {
+        val result = replies.firstNotNullOfOrNull { reply ->
             ensureSearchActive()
             val replyIndex = GomokuRules.index(reply.row, reply.col)
             board[replyIndex] = defender
-            val result = proveVctAttackNode(board, attacker, remainingAttackPlies, candidateLimit)
+            val child = proveVctAttackNode(
+                board,
+                hashAfterAttack xor zobristKey(replyIndex, defender),
+                attacker,
+                remainingAttackPlies,
+                candidateLimit,
+            )
             board[replyIndex] = EMPTY
-            if (!result.proven) return ThreatProof(false, 1, 0)
-            proofNumber = min(proofNumber, result.proofNumber)
-            disproofNumber = saturatingAdd(disproofNumber, result.disproofNumber)
-        }
-        return ThreatProof(true, 0, disproofNumber.coerceAtLeast(1))
+            if (!child.proven) ThreatProof(false, 1, 0) else {
+                disproofNumber = saturatingAdd(disproofNumber, child.disproofNumber)
+                null
+            }
+        } ?: ThreatProof(true, 0, disproofNumber.coerceAtLeast(1))
+        storeThreatProof(key, remainingAttackPlies, result)
+        return result
     }
 
     private fun tacticalAttackCandidates(
@@ -634,6 +672,19 @@ class GomokuAi {
             .distinctBy { GomokuRules.index(it.row, it.col) }
             .sortedByDescending { it.score }
             .take(VCT_DEFENSE_WIDTH)
+    }
+
+    private fun storeThreatProof(key: Long, remainingAttackPlies: Int, proof: ThreatProof) {
+        val old = threatCache[key]
+        if (old != null && old.remainingAttackPlies > remainingAttackPlies) return
+        if (threatCache.size >= MAX_THREAT_CACHE_ENTRIES) threatCache.clear()
+        threatCache[key] = ThreatCacheEntry(remainingAttackPlies, proof)
+    }
+
+    private fun threatKey(hash: Long, attacker: Int, remainingAttackPlies: Int, node: ThreatNode): Long {
+        val attackerKey = if (attacker == BLACK) sideToMoveKey else candidateKey
+        val nodeKey = if (node == ThreatNode.ATTACK) THREAT_ATTACK_KEY else THREAT_DEFENSE_KEY
+        return hash xor attackerKey xor nodeKey xor (remainingAttackPlies.toLong() * THREAT_DEPTH_KEY)
     }
 
     private fun saturatingAdd(first: Int, second: Int): Int =
@@ -895,6 +946,7 @@ class GomokuAi {
         const val MAX_TRANSPOSITION_ENTRIES = 120_000
         const val MAX_CANDIDATE_CACHE_ENTRIES = 24_000
         const val MAX_PATTERN_CACHE_ENTRIES = 120_000
+        const val MAX_THREAT_CACHE_ENTRIES = 40_000
         const val MAX_SEARCH_DEPTH = 16
         const val KILLER_BONUS = 1_400_000
         const val HISTORY_UNIT = 1_600
@@ -903,5 +955,8 @@ class GomokuAi {
         const val VCT_ATTACK_WIDTH = 8
         const val VCT_DEFENSE_WIDTH = 10
         const val VCT_THREAT_SCORE = OPEN_THREE_SCORE
+        const val THREAT_ATTACK_KEY = 4728994379047901173L
+        const val THREAT_DEFENSE_KEY = -3461809123399808739L
+        const val THREAT_DEPTH_KEY = 2013432432449137307L
     }
 }
