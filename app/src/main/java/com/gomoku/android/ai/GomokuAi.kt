@@ -41,6 +41,13 @@ class GomokuAi {
         val rank: Int,
     )
 
+    /** 攻击节点为 OR，防守节点为 AND 的受控威胁证明结果。 */
+    private data class ThreatProof(
+        val proven: Boolean,
+        val proofNumber: Int,
+        val disproofNumber: Int,
+    )
+
     private class SearchAborted : RuntimeException()
 
     private val directions = arrayOf(1 to 0, 0 to 1, 1 to 1, 1 to -1)
@@ -78,6 +85,8 @@ class GomokuAi {
         deadlineNanos = System.nanoTime() + difficulty.timeBudgetMs * 1_000_000L
 
         val workingBoard = board.copyOf()
+        openingBookMove(workingBoard, player)?.let { return AiResult(it, 0, searchedNodes) }
+
         val initialHash = computeHash(workingBoard)
         val allCandidates = orderedCandidates(
             board = workingBoard,
@@ -96,26 +105,28 @@ class GomokuAi {
             return AiResult(Move(block.row, block.col, player), 0, searchedNodes)
         }
 
-        // 仅在高难度中运行 VCF。它搜索“制造唯一必防四 -> 对手被迫封堵 -> 再制造必防四”的链。
+        // 高难度优先进行强制杀棋；超时则直接退回常规 PVS，绝不影响本次落子返回。
         if (difficulty != AiDifficulty.EASY && difficulty != AiDifficulty.NORMAL) {
-            findVcfWinningMove(
-                board = workingBoard,
-                attacker = player,
-                attackPlies = if (difficulty == AiDifficulty.MASTER) 4 else 3,
-                candidateLimit = max(16, difficulty.candidateLimit + 4),
-            )?.let { return AiResult(it, 0, searchedNodes) }
-
-            // 对手若存在 VCF 起手，优先占据该关键点；常规 Alpha-Beta 会继续比较其他防守手。
-            findVcfWinningMove(
-                board = workingBoard,
-                attacker = enemy,
-                attackPlies = if (difficulty == AiDifficulty.MASTER) 4 else 3,
-                candidateLimit = max(16, difficulty.candidateLimit + 4),
-            )?.let { threat ->
-                if (GomokuRules.isEmpty(workingBoard, threat.row, threat.col)) {
-                    return AiResult(Move(threat.row, threat.col, player), 0, searchedNodes)
+            var tacticalChoice: Move? = null
+            try {
+                val attackPlies = if (difficulty == AiDifficulty.MASTER) 4 else 3
+                val tacticalWidth = max(16, difficulty.candidateLimit + 4)
+                tacticalChoice = findVcfWinningMove(workingBoard, player, attackPlies, tacticalWidth)
+                if (tacticalChoice == null && difficulty == AiDifficulty.MASTER) {
+                    tacticalChoice = findVctWinningMove(workingBoard, player, VCT_ATTACK_PLIES, VCT_ATTACK_WIDTH)
                 }
+                if (tacticalChoice == null) {
+                    val enemyVcf = findVcfWinningMove(workingBoard, enemy, attackPlies, tacticalWidth)
+                    if (enemyVcf != null) tacticalChoice = Move(enemyVcf.row, enemyVcf.col, player)
+                }
+                if (tacticalChoice == null && difficulty == AiDifficulty.MASTER) {
+                    val enemyVct = findVctWinningMove(workingBoard, enemy, VCT_ATTACK_PLIES, VCT_ATTACK_WIDTH)
+                    if (enemyVct != null) tacticalChoice = Move(enemyVct.row, enemyVct.col, player)
+                }
+            } catch (_: SearchAborted) {
+                // 留给时间受限的迭代加深搜索选择稳定回退着法。
             }
+            tacticalChoice?.let { return AiResult(it, 0, searchedNodes) }
         }
 
         val limited = allCandidates.take(difficulty.candidateLimit)
@@ -142,6 +153,37 @@ class GomokuAi {
             }
         }
         return AiResult(bestMove, completedDepth, searchedNodes)
+    }
+
+    /**
+     * 轻量中心化开局库：仅覆盖前两手，避免依赖特定开局规则，同时让 AI 开局更自然。
+     * 后续手数立即交回战术搜索，因此不会压制局面特有的防守需求。
+     */
+    private fun openingBookMove(board: IntArray, player: Int): Move? {
+        val occupied = board.indices.filter { board[it] != EMPTY }
+        val center = BOARD_SIZE / 2
+        return when (occupied.size) {
+            0 -> Move(center, center, player)
+            1 -> {
+                val first = occupied.first()
+                if (first != GomokuRules.index(center, center)) return null
+                val replyOffsets = arrayOf(-2 to 0, 0 to -2, 2 to 0, 0 to 2, -2 to -2, 2 to 2, -2 to 2, 2 to -2)
+                val offset = replyOffsets[first % replyOffsets.size]
+                val row = center + offset.first
+                val col = center + offset.second
+                if (GomokuRules.isEmpty(board, row, col)) Move(row, col, player) else null
+            }
+            2 -> {
+                val hasCenter = board[GomokuRules.index(center, center)] != EMPTY
+                if (!hasCenter) return null
+                val thirdMoveOffsets = arrayOf(-3 to -3, 3 to 3, -3 to 3, 3 to -3)
+                val offset = thirdMoveOffsets[occupied.sum() % thirdMoveOffsets.size]
+                val row = center + offset.first
+                val col = center + offset.second
+                if (GomokuRules.isEmpty(board, row, col)) Move(row, col, player) else null
+            }
+            else -> null
+        }
     }
 
     private fun searchRoot(
@@ -448,6 +490,147 @@ class GomokuAi {
         return forced
     }
 
+    /**
+     * 受控 VCT：除冲四外还允许活三/跳三等威胁作为攻击节点；防守节点以 AND 语义
+     * 逐一验证所有战术响应。宽度与深度严格受限，仅在大师档且 VCF 无解时运行。
+     */
+    private fun findVctWinningMove(
+        board: IntArray,
+        attacker: Int,
+        attackPlies: Int,
+        candidateLimit: Int,
+    ): Move? {
+        val attacks = tacticalAttackCandidates(board, attacker, candidateLimit)
+        for (attack in attacks) {
+            ensureSearchActive()
+            val proof = tryVctAttack(board, attacker, attack, attackPlies - 1, candidateLimit)
+            if (proof.proven) return Move(attack.row, attack.col, attacker)
+        }
+        return null
+    }
+
+    private fun proveVctAttackNode(
+        board: IntArray,
+        attacker: Int,
+        remainingAttackPlies: Int,
+        candidateLimit: Int,
+    ): ThreatProof {
+        if (remainingAttackPlies <= 0) return ThreatProof(false, 1, 0)
+        val attacks = tacticalAttackCandidates(board, attacker, candidateLimit)
+        var proofNumber = 0
+        var disproofNumber = Int.MAX_VALUE
+        for (attack in attacks) {
+            ensureSearchActive()
+            val result = tryVctAttack(board, attacker, attack, remainingAttackPlies - 1, candidateLimit)
+            if (result.proven) return ThreatProof(true, 0, 1)
+            proofNumber = saturatingAdd(proofNumber, result.proofNumber)
+            disproofNumber = min(disproofNumber, result.disproofNumber)
+        }
+        return ThreatProof(false, proofNumber.coerceAtLeast(1), disproofNumber.coerceAtLeast(1))
+    }
+
+    private fun tryVctAttack(
+        board: IntArray,
+        attacker: Int,
+        attack: ScoredMove,
+        remainingAttackPlies: Int,
+        candidateLimit: Int,
+    ): ThreatProof {
+        val defender = GomokuRules.opponent(attacker)
+        val attackIndex = GomokuRules.index(attack.row, attack.col)
+        board[attackIndex] = attacker
+
+        val result = when {
+            GomokuRules.isWinningMove(board, Move(attack.row, attack.col, attacker)) -> ThreatProof(true, 0, 1)
+            immediateWinningMoves(board, defender, VCT_DEFENSE_WIDTH).isNotEmpty() -> ThreatProof(false, 1, 0)
+            else -> {
+                val directWins = immediateWinningMoves(board, attacker, VCT_DEFENSE_WIDTH)
+                when {
+                    directWins.size >= 2 -> ThreatProof(true, 0, 1)
+                    directWins.size == 1 -> {
+                        val forcedBlock = directWins.first()
+                        val blockIndex = GomokuRules.index(forcedBlock.row, forcedBlock.col)
+                        board[blockIndex] = defender
+                        val continuation = proveVctAttackNode(
+                            board,
+                            attacker,
+                            remainingAttackPlies,
+                            candidateLimit,
+                        )
+                        board[blockIndex] = EMPTY
+                        continuation
+                    }
+                    remainingAttackPlies <= 0 -> ThreatProof(false, 1, 0)
+                    else -> verifyVctDefenses(board, attacker, remainingAttackPlies, candidateLimit, attack)
+                }
+            }
+        }
+        board[attackIndex] = EMPTY
+        return result
+    }
+
+    private fun verifyVctDefenses(
+        board: IntArray,
+        attacker: Int,
+        remainingAttackPlies: Int,
+        candidateLimit: Int,
+        lastAttack: ScoredMove,
+    ): ThreatProof {
+        val defender = GomokuRules.opponent(attacker)
+        val replies = vctDefensiveCandidates(board, defender, lastAttack, candidateLimit)
+        if (replies.isEmpty()) return ThreatProof(false, 1, 0)
+
+        var proofNumber = Int.MAX_VALUE
+        var disproofNumber = 0
+        for (reply in replies) {
+            ensureSearchActive()
+            val replyIndex = GomokuRules.index(reply.row, reply.col)
+            board[replyIndex] = defender
+            val result = proveVctAttackNode(board, attacker, remainingAttackPlies, candidateLimit)
+            board[replyIndex] = EMPTY
+            if (!result.proven) return ThreatProof(false, 1, 0)
+            proofNumber = min(proofNumber, result.proofNumber)
+            disproofNumber = saturatingAdd(disproofNumber, result.disproofNumber)
+        }
+        return ThreatProof(true, 0, disproofNumber.coerceAtLeast(1))
+    }
+
+    private fun tacticalAttackCandidates(
+        board: IntArray,
+        attacker: Int,
+        candidateLimit: Int,
+    ): List<ScoredMove> {
+        val generated = orderedCandidates(board, attacker, candidateLimit * 2)
+        val forcing = generated.filter { it.score >= VCT_THREAT_SCORE }
+        return (if (forcing.isEmpty()) generated else forcing).take(candidateLimit)
+    }
+
+    private fun vctDefensiveCandidates(
+        board: IntArray,
+        defender: Int,
+        lastAttack: ScoredMove,
+        candidateLimit: Int,
+    ): List<ScoredMove> {
+        val primary = orderedCandidates(board, defender, max(VCT_DEFENSE_WIDTH, candidateLimit)).take(VCT_DEFENSE_WIDTH)
+        val nearby = ArrayList<ScoredMove>()
+        for (dr in -2..2) {
+            for (dc in -2..2) {
+                val row = lastAttack.row + dr
+                val col = lastAttack.col + dc
+                if (GomokuRules.isInside(row, col) && GomokuRules.isEmpty(board, row, col)) {
+                    nearby += ScoredMove(row, col, scoreCandidate(board, row, col, defender))
+                }
+            }
+        }
+        return (primary + nearby)
+            .distinctBy { GomokuRules.index(it.row, it.col) }
+            .sortedByDescending { it.score }
+            .take(VCT_DEFENSE_WIDTH)
+    }
+
+    private fun saturatingAdd(first: Int, second: Int): Int =
+        if (first >= Int.MAX_VALUE - second) Int.MAX_VALUE else first + second
+
     private fun immediateWinningMove(
         board: IntArray,
         player: Int,
@@ -708,5 +891,9 @@ class GomokuAi {
         const val KILLER_BONUS = 1_400_000
         const val HISTORY_UNIT = 1_600
         const val MAX_HISTORY_BONUS = 1_000_000
+        const val VCT_ATTACK_PLIES = 3
+        const val VCT_ATTACK_WIDTH = 8
+        const val VCT_DEFENSE_WIDTH = 10
+        const val VCT_THREAT_SCORE = OPEN_THREE_SCORE
     }
 }

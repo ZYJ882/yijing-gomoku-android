@@ -32,6 +32,23 @@ class GomokuCoreTest {
     }
 
     @Test
+    fun `opening book takes the center on an empty board`() {
+        val result = GomokuAi().chooseMove(GomokuRules.createBoard(), BLACK, AiDifficulty.MASTER)
+
+        assertEquals(Move(7, 7, BLACK), result.move)
+    }
+
+    @Test
+    fun `opening book answers a centered opening with a balanced reply`() {
+        val board = GomokuRules.createBoard()
+        board[GomokuRules.index(7, 7)] = BLACK
+
+        val result = GomokuAi().chooseMove(board, WHITE, AiDifficulty.MASTER)
+
+        assertEquals(Move(5, 7, WHITE), result.move)
+    }
+
+    @Test
     fun `ai blocks an opponent immediate five`() {
         val board = GomokuRules.createBoard()
         repeat(4) { col -> board[GomokuRules.index(7, col + 3)] = BLACK }
@@ -132,5 +149,22 @@ class GomokuCoreTest {
             "AI 应抢占黑棋形成开放四的任一关键点",
             result.move.row == 7 && (result.move.col == 3 || result.move.col == 7),
         )
+    }
+
+    @Test
+    fun `master ai returns a legal move within a guarded midgame budget`() {
+        val board = GomokuRules.createBoard()
+        val black = listOf(7 to 7, 6 to 6, 8 to 8, 7 to 5, 5 to 8, 9 to 6)
+        val white = listOf(7 to 6, 6 to 7, 8 to 7, 7 to 8, 5 to 7, 9 to 7)
+        black.forEach { (row, col) -> board[GomokuRules.index(row, col)] = BLACK }
+        white.forEach { (row, col) -> board[GomokuRules.index(row, col)] = WHITE }
+
+        val startedAt = System.nanoTime()
+        val result = GomokuAi().chooseMove(board, BLACK, AiDifficulty.MASTER)
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+
+        assertTrue(GomokuRules.isInside(result.move.row, result.move.col))
+        assertEquals(0, board[GomokuRules.index(result.move.row, result.move.col)])
+        assertTrue("受控威胁搜索应在移动端保护时间内返回", elapsedMs < 3_000)
     }
 }
