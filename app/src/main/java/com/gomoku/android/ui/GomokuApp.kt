@@ -460,7 +460,7 @@ private fun MatchScreen(state: GameUiState, viewModel: GameViewModel) {
     }
     Spacer(Modifier.height(9.dp))
     Text(
-        text = if (state.mode == GameMode.AI) "自由规则 · 15 × 15 · 每局随机先手" else "局域网直连 · 每局随机先手 · 双方实时同步落子",
+        text = if (state.mode == GameMode.AI) "自由规则 · 15 × 15 · ${state.firstMovePreference.label}" else "局域网直连 · 每局随机先手 · 双方实时同步落子",
         color = Color(0xFF9BA9BD),
         style = MaterialTheme.typography.labelMedium,
         modifier = Modifier.fillMaxWidth(),

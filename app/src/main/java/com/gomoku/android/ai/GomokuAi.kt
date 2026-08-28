@@ -94,8 +94,8 @@ class GomokuAi {
         deadlineNanos = System.nanoTime() + difficulty.timeBudgetMs * 1_000_000L
 
         val workingBoard = board.copyOf()
-        openingBookMove(workingBoard, player)?.let { return AiResult(it, 0, searchedNodes) }
 
+        // 规则级一手胜负永远优先于开局库，避免开局推荐覆盖真正的成五或必防点。
         rootImmediateWinningMove(workingBoard, player)?.let {
             return AiResult(it, 0, searchedNodes)
         }
@@ -103,6 +103,11 @@ class GomokuAi {
         val enemy = GomokuRules.opponent(player)
         rootImmediateWinningMove(workingBoard, enemy)?.let { block ->
             return AiResult(Move(block.row, block.col, player), 0, searchedNodes)
+        }
+
+        // 新手档保留少量随机性，不使用固定开局库，避免一开始就被引导到强制套路。
+        if (difficulty != AiDifficulty.EASY) {
+            openingBookMove(workingBoard, player)?.let { return AiResult(it, 0, searchedNodes) }
         }
 
         val initialHash = computeHash(workingBoard)
@@ -140,7 +145,7 @@ class GomokuAi {
 
         val limited = allCandidates.take(difficulty.candidateLimit)
         if (difficulty == AiDifficulty.EASY) {
-            val variety = min(3, limited.size)
+            val variety = min(5, limited.size)
             val picked = if (variety > 0) limited[Random.nextInt(variety)] else fallback
             return AiResult(Move(picked.row, picked.col, player), 0, searchedNodes)
         }

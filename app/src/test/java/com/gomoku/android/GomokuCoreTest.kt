@@ -49,6 +49,40 @@ class GomokuCoreTest {
     }
 
     @Test
+    fun `immediate win takes priority over opening book`() {
+        val board = GomokuRules.createBoard()
+        board[GomokuRules.index(7, 7)] = BLACK
+        repeat(4) { col -> board[GomokuRules.index(6, col + 3)] = WHITE }
+
+        val result = GomokuAi().chooseMove(board, WHITE, AiDifficulty.MASTER)
+
+        assertTrue("开局库不得覆盖一手成五", result.move.row == 6 && (result.move.col == 2 || result.move.col == 7))
+    }
+
+    @Test
+    fun `immediate block takes priority over opening book`() {
+        val board = GomokuRules.createBoard()
+        board[GomokuRules.index(7, 7)] = BLACK
+        repeat(4) { col -> board[GomokuRules.index(6, col + 3)] = BLACK }
+
+        val result = GomokuAi().chooseMove(board, WHITE, AiDifficulty.MASTER)
+
+        assertTrue("开局库不得覆盖对手一手胜负", result.move.row == 6 && (result.move.col == 2 || result.move.col == 7))
+    }
+
+    @Test
+    fun `easy ai returns a legal move with a lighter budget`() {
+        val board = GomokuRules.createBoard()
+        board[GomokuRules.index(7, 7)] = BLACK
+
+        val result = GomokuAi().chooseMove(board, WHITE, AiDifficulty.EASY)
+
+        assertTrue(GomokuRules.isInside(result.move.row, result.move.col))
+        assertEquals(0, board[GomokuRules.index(result.move.row, result.move.col)])
+        assertTrue("新手档应使用轻量思考预算", AiDifficulty.EASY.timeBudgetMs <= 30L)
+    }
+
+    @Test
     fun `ai blocks an opponent immediate five`() {
         val board = GomokuRules.createBoard()
         repeat(4) { col -> board[GomokuRules.index(7, col + 3)] = BLACK }

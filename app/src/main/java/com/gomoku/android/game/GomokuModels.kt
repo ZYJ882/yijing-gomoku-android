@@ -81,7 +81,7 @@ enum class AiDifficulty(
     val maxDepth: Int,
     val candidateLimit: Int,
 ) {
-    EASY("新手", 60L, 1, 6),
+    EASY("新手", 30L, 1, 5),
     NORMAL("普通", 220L, 2, 9),
     HARD("困难", 700L, 4, 12),
     MASTER("大师", 1_500L, 5, 14),

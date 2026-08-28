@@ -10,6 +10,7 @@ import com.gomoku.android.network.LanMultiplayerManager
 import com.gomoku.android.network.LanRole
 import com.gomoku.android.network.LanRoom
 import com.gomoku.android.network.LanUiState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
@@ -317,35 +318,55 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     private fun requestAiMove(boardSnapshot: IntArray, aiPlayer: Int, difficulty: AiDifficulty) {
         aiJob?.cancel()
         aiJob = viewModelScope.launch {
-            val result = withContext(Dispatchers.Default) {
-                ai.chooseMove(
-                    board = boardSnapshot,
-                    player = aiPlayer,
-                    difficulty = difficulty,
-                    shouldCancel = { Thread.currentThread().isInterrupted },
-                )
+            val result = try {
+                withContext(Dispatchers.Default) {
+                    ai.chooseMove(
+                        board = boardSnapshot,
+                        player = aiPlayer,
+                        difficulty = difficulty,
+                        shouldCancel = { Thread.currentThread().isInterrupted },
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
             }
             ensureActive()
 
             val state = uiState.value
             if (state.mode != GameMode.AI || !state.isMatchPlaying || state.status != GameStatus.PLAYING || state.currentPlayer != aiPlayer) return@launch
-            if (!GomokuRules.isEmpty(state.board, result.move.row, result.move.col)) return@launch
+            val selected = result?.move?.takeIf { GomokuRules.isEmpty(state.board, it.row, it.col) }
+                ?: firstLegalMove(state.board, aiPlayer)
+            if (selected == null) {
+                uiState.value = state.copy(isAiThinking = false)
+                return@launch
+            }
 
             val nextBoard = state.board.copyOf()
-            nextBoard[GomokuRules.index(result.move.row, result.move.col)] = aiPlayer
-            val status = calculateStatus(nextBoard, result.move)
+            nextBoard[GomokuRules.index(selected.row, selected.col)] = aiPlayer
+            val status = calculateStatus(nextBoard, selected)
             uiState.value = state.copy(
                 board = nextBoard,
-                history = state.history + result.move,
+                history = state.history + selected,
                 currentPlayer = if (status == GameStatus.PLAYING) GomokuRules.opponent(aiPlayer) else aiPlayer,
                 status = status,
                 phase = if (status == GameStatus.PLAYING) MatchPhase.PLAYING else MatchPhase.FINISHED,
                 isAiThinking = false,
-                lastMove = result.move,
-                aiDepth = result.completedDepth,
-                aiNodes = result.searchedNodes,
+                lastMove = selected,
+                aiDepth = result?.completedDepth ?: 0,
+                aiNodes = result?.searchedNodes ?: 0,
             )
         }
+    }
+
+    private fun firstLegalMove(board: IntArray, player: Int): Move? {
+        val center = BOARD_SIZE / 2
+        if (GomokuRules.isEmpty(board, center, center)) return Move(center, center, player)
+        for (index in board.indices) {
+            if (board[index] == EMPTY) return Move(index / BOARD_SIZE, index % BOARD_SIZE, player)
+        }
+        return null
     }
 
     private fun onLanEvent(event: LanEvent) {

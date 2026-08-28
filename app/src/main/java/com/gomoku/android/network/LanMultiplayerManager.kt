@@ -115,6 +115,8 @@ class LanMultiplayerManager(context: Context) {
     }
 
     fun join(room: LanRoom) {
+        // 先屏蔽旧读线程的离开事件，再关闭旧套接字，避免重连时串扰新连接。
+        closedByUser = true
         stopDiscovery()
         closePeerOnly()
         closedByUser = false
@@ -255,13 +257,13 @@ class LanMultiplayerManager(context: Context) {
                         handleIncoming(line)
                     }
                 }
-                if (!closedByUser) post(LanEvent.PeerLeft)
+                if (!closedByUser && peerSocket === socket) post(LanEvent.PeerLeft)
             } catch (error: SocketException) {
-                if (!closedByUser) post(LanEvent.PeerLeft)
+                if (!closedByUser && peerSocket === socket) post(LanEvent.PeerLeft)
             } catch (error: Exception) {
-                if (!closedByUser) post(LanEvent.Error("连接中断：${error.userMessage()}"))
+                if (!closedByUser && peerSocket === socket) post(LanEvent.Error("连接中断：${error.userMessage()}"))
             } finally {
-                closePeerOnly()
+                closePeerOnly(socket)
             }
         }
     }
@@ -314,12 +316,13 @@ class LanMultiplayerManager(context: Context) {
         }
     }
 
-    private fun closePeerOnly() {
+    private fun closePeerOnly(expected: Socket? = null) {
+        val socket = peerSocket
+        if (expected != null && socket !== expected) return
+        peerSocket = null
         try {
-            peerSocket?.close()
+            socket?.close()
         } catch (_: Exception) {
-        } finally {
-            peerSocket = null
         }
     }
 

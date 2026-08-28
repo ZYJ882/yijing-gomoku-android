@@ -53,7 +53,8 @@ Java_com_gomoku_android_ai_NativeTacticalScanner_nativeWinningMoveIndices(
     jintArray boardArray,
     jint player
 ) {
-    if (boardArray == nullptr || env->GetArrayLength(boardArray) != kBoardCells) {
+    if (boardArray == nullptr || env->GetArrayLength(boardArray) != kBoardCells ||
+        (player != 1 && player != 2)) {
         return env->NewIntArray(0);
     }
 
