@@ -11,3 +11,4 @@
 
 # Local build and test logs
 *.log
+/release/

@@ -832,7 +832,7 @@ class GomokuAi {
         var fours = 0
         var openThrees = 0
         for ((dr, dc) in directions) {
-            val threat = classifyLine(makeLine(board, row, col, dr, dc, player))
+            val threat = classifyLine(encodeLine(board, row, col, dr, dc, player))
             total += threat.score
             if (threat.rank >= 4) fours++
             if (threat.rank == 3) openThrees++
@@ -842,46 +842,23 @@ class GomokuAi {
         return total
     }
 
-    private fun makeLine(
-        board: IntArray,
-        row: Int,
-        col: Int,
-        dr: Int,
-        dc: Int,
-        player: Int,
-    ): String = buildString(11) {
-        for (offset in -5..5) {
-            val r = row + offset * dr
-            val c = col + offset * dc
-            append(
-                when {
-                    !GomokuRules.isInside(r, c) -> '#'
-                    board[GomokuRules.index(r, c)] == player -> 'X'
-                    board[GomokuRules.index(r, c)] == EMPTY -> '.'
-                    else -> 'O'
-                },
-            )
-        }
-    }
-
     /**
      * 四方向局部模式表。X 表示当前方，. 表示空点，O/# 表示阻断。
-     * 模式按威胁强度返回单方向最高等级，避免同一线段被低阶模式重复放大。
+     * 使用三进制整数直接匹配，避免搜索节点中反复创建 11 字符临时字符串。
      */
-    private fun classifyLine(line: String): LineThreat {
-        val code = encodeLine(line)
+    private fun classifyLine(code: Int): LineThreat {
         patternCodeCache[code]?.let { return it }
         val threat = when {
-            "XXXXX" in line -> LineThreat(FIVE_SCORE, 5)
-            ".XXXX." in line -> LineThreat(OPEN_FOUR_SCORE, 4)
-            hasAny(line, "XXX.X", "XX.XX", "X.XXX") -> LineThreat(BROKEN_FOUR_SCORE, 4)
-            "XXXX." in line || ".XXXX" in line -> LineThreat(CLOSED_FOUR_SCORE, 4)
-            ".XXX." in line -> LineThreat(OPEN_THREE_SCORE, 3)
-            hasAny(line, ".XX.X.", ".X.XX.", ".X.X.X.") -> LineThreat(BROKEN_THREE_SCORE, 3)
-            "XXX." in line || ".XXX" in line -> LineThreat(CLOSED_THREE_SCORE, 2)
-            ".XX." in line -> LineThreat(OPEN_TWO_SCORE, 2)
-            hasAny(line, ".X.X.", ".X..X.") -> LineThreat(BROKEN_TWO_SCORE, 1)
-            "XX." in line || ".XX" in line -> LineThreat(CLOSED_TWO_SCORE, 1)
+            containsPattern(code, "XXXXX") -> LineThreat(FIVE_SCORE, 5)
+            containsPattern(code, ".XXXX.") -> LineThreat(OPEN_FOUR_SCORE, 4)
+            hasAny(code, "XXX.X", "XX.XX", "X.XXX") -> LineThreat(BROKEN_FOUR_SCORE, 4)
+            containsPattern(code, "XXXX.") || containsPattern(code, ".XXXX") -> LineThreat(CLOSED_FOUR_SCORE, 4)
+            containsPattern(code, ".XXX.") -> LineThreat(OPEN_THREE_SCORE, 3)
+            hasAny(code, ".XX.X.", ".X.XX.", ".X.X.X.") -> LineThreat(BROKEN_THREE_SCORE, 3)
+            containsPattern(code, "XXX.") || containsPattern(code, ".XXX") -> LineThreat(CLOSED_THREE_SCORE, 2)
+            containsPattern(code, ".XX.") -> LineThreat(OPEN_TWO_SCORE, 2)
+            hasAny(code, ".X.X.", ".X..X.") -> LineThreat(BROKEN_TWO_SCORE, 1)
+            containsPattern(code, "XX.") || containsPattern(code, ".XX") -> LineThreat(CLOSED_TWO_SCORE, 1)
             else -> LineThreat(SINGLE_SCORE, 0)
         }
         if (patternCodeCache.size >= MAX_PATTERN_CACHE_ENTRIES) patternCodeCache.clear()
@@ -889,20 +866,52 @@ class GomokuAi {
         return threat
     }
 
-    /** 将局部线段编码为三进制：空点 0、己方 1、阻断点 2。 */
-    private fun encodeLine(line: String): Int {
+    private fun encodeLine(
+        board: IntArray,
+        row: Int,
+        col: Int,
+        dr: Int,
+        dc: Int,
+        player: Int,
+    ): Int {
         var code = 0
-        for (cell in line) {
-            code = code * 3 + when (cell) {
-                '.' -> 0
-                'X' -> 1
+        for (offset in -5..5) {
+            val r = row + offset * dr
+            val c = col + offset * dc
+            val digit = when {
+                !GomokuRules.isInside(r, c) -> 2
+                board[GomokuRules.index(r, c)] == player -> 1
+                board[GomokuRules.index(r, c)] == EMPTY -> 0
                 else -> 2
             }
+            code = code * 3 + digit
         }
         return code
     }
 
-    private fun hasAny(line: String, vararg patterns: String): Boolean = patterns.any { it in line }
+    private fun hasAny(code: Int, vararg patterns: String): Boolean = patterns.any { containsPattern(code, it) }
+
+    private fun containsPattern(code: Int, pattern: String): Boolean {
+        if (pattern.length > 11) return false
+        val startLimit = 11 - pattern.length
+        for (start in 0..startLimit) {
+            var matches = true
+            for (offset in pattern.indices) {
+                val actual = (code / POW3[10 - start - offset]) % 3
+                val expected = when (pattern[offset]) {
+                    '.' -> 0
+                    'X' -> 1
+                    else -> 2
+                }
+                if (actual != expected) {
+                    matches = false
+                    break
+                }
+            }
+            if (matches) return true
+        }
+        return false
+    }
 
     private fun computeHash(board: IntArray): Long {
         var hash = 0L
@@ -963,5 +972,10 @@ class GomokuAi {
         const val THREAT_ATTACK_KEY = 4728994379047901173L
         const val THREAT_DEFENSE_KEY = -3461809123399808739L
         const val THREAT_DEPTH_KEY = 2013432432449137307L
+        val POW3 = IntArray(12) { index ->
+            var value = 1
+            repeat(index) { value *= 3 }
+            value
+        }
     }
 }

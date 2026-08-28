@@ -44,7 +44,7 @@ sealed interface LanEvent {
     data class RoomsChanged(val rooms: List<LanRoom>) : LanEvent
     data object PeerJoined : LanEvent
     data class MatchStarted(val hostPlayer: Int) : LanEvent
-    data class RemoteMoveReceived(val move: Move) : LanEvent
+    data class RemoteMoveReceived(val move: Move, val sequence: Long) : LanEvent
     data class PauseChanged(val paused: Boolean) : LanEvent
     data object PeerLeft : LanEvent
     data class Error(val reason: String) : LanEvent

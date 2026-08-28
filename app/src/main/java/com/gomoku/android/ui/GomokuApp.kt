@@ -55,6 +55,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
@@ -553,6 +555,10 @@ private fun GomokuBoard(
             .clip(corner)
             .background(BoardWood)
             .border(2.dp, Color(0xFFFADE9D), corner)
+            .semantics {
+                val stones = board.count { it != EMPTY }
+                contentDescription = "五子棋棋盘，15乘15，已有${stones}步，${if (enabled) "当前可以落子" else "当前不可落子"}"
+            }
             .onSizeChanged { canvasSize = it }
             .pointerInput(enabled) {
                 if (enabled) {

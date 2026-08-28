@@ -17,6 +17,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.util.concurrent.ExecutorService
+import java.util.UUID
 import java.util.concurrent.Executors
 
 /**
@@ -30,24 +31,30 @@ class LanMultiplayerManager(context: Context) {
     private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor: ExecutorService = Executors.newCachedThreadPool()
+    private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val writeLock = Any()
     private val roomsByServiceName = linkedMapOf<String, LanRoom>()
     private val resolvingServices = mutableSetOf<String>()
 
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var peerSocket: Socket? = null
+    @Volatile private var peerWriter: BufferedWriter? = null
     @Volatile private var isDiscovering = false
     @Volatile private var isRegistered = false
     @Volatile private var closedByUser = false
     private var advertisedServiceName: String? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
+    private var connectionSessionId: String = UUID.randomUUID().toString()
+    @Volatile private var activePeerSessionId: String? = null
+    @Volatile private var lastReceivedSequence: Long = 0L
 
     var eventListener: (LanEvent) -> Unit = {}
 
     fun host(roomName: String) {
         leave(announce = false)
         closedByUser = false
+        resetProtocolState()
         executor.execute {
             try {
                 val server = ServerSocket(0)
@@ -65,6 +72,7 @@ class LanMultiplayerManager(context: Context) {
                 startReader(accepted)
                 postState(LanConnectionState.CONNECTED, LanRole.HOST, "玩家已加入，你执黑棋先手")
                 post(LanEvent.PeerJoined)
+                send(JSONObject().put("type", TYPE_HELLO))
             } catch (error: Exception) {
                 if (!closedByUser) post(LanEvent.Error("开房失败：${error.userMessage()}"))
             }
@@ -120,6 +128,7 @@ class LanMultiplayerManager(context: Context) {
         stopDiscovery()
         closePeerOnly()
         closedByUser = false
+        resetProtocolState()
         postState(LanConnectionState.CONNECTING, LanRole.GUEST, "正在加入 ${room.serviceName}…")
         executor.execute {
             try {
@@ -131,8 +140,10 @@ class LanMultiplayerManager(context: Context) {
                     return@execute
                 }
                 peerSocket = socket
+                peerWriter = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
                 startReader(socket)
                 postState(LanConnectionState.CONNECTED, LanRole.GUEST, "已连接，等待房主开始对局…")
+                send(JSONObject().put("type", TYPE_HELLO))
                 send(JSONObject().put("type", TYPE_JOIN))
             } catch (error: Exception) {
                 if (!closedByUser) post(LanEvent.Error("加入失败：${error.userMessage()}"))
@@ -172,12 +183,14 @@ class LanMultiplayerManager(context: Context) {
             serverSocket = null
         }
         advertisedServiceName = null
+        resetProtocolState()
         postState(LanConnectionState.IDLE, LanRole.NONE, "在同一 Wi‑Fi 下创建或扫描房间")
     }
 
     fun release() {
         leave()
         executor.shutdownNow()
+        sendExecutor.shutdownNow()
     }
 
     private fun registerRoom(roomName: String, port: Int) {
@@ -270,16 +283,37 @@ class LanMultiplayerManager(context: Context) {
 
     private fun handleIncoming(raw: String) {
         try {
+            if (raw.length > MAX_MESSAGE_LENGTH) throw IllegalArgumentException("消息过长")
             val message = JSONObject(raw)
+            if (message.optInt("protocol", -1) != PROTOCOL_VERSION) {
+                throw IllegalArgumentException("协议版本不兼容")
+            }
+            val peerSession = message.optString("sessionId").takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException("缺少会话标识")
+            val knownSession = activePeerSessionId
+            if (knownSession == null) {
+                activePeerSessionId = peerSession
+            } else if (knownSession != peerSession) {
+                throw IllegalArgumentException("消息来自旧连接")
+            }
             when (message.optString("type")) {
+                TYPE_HELLO -> Unit
                 TYPE_START -> post(LanEvent.MatchStarted(message.getInt("hostPlayer")))
-                TYPE_MOVE -> post(
-                    LanEvent.RemoteMoveReceived(
-                        Move(message.getInt("row"), message.getInt("col"), message.getInt("player")),
-                    ),
-                )
+                TYPE_MOVE -> {
+                    val sequence = message.getLong("sequence")
+                    if (sequence <= lastReceivedSequence) return
+                    lastReceivedSequence = sequence
+                    post(
+                        LanEvent.RemoteMoveReceived(
+                            Move(message.getInt("row"), message.getInt("col"), message.getInt("player")),
+                            sequence,
+                        ),
+                    )
+                }
                 TYPE_PAUSE -> post(LanEvent.PauseChanged(message.getBoolean("paused")))
                 TYPE_LEAVE -> post(LanEvent.PeerLeft)
+                TYPE_JOIN -> Unit
+                else -> throw IllegalArgumentException("未知消息类型")
             }
         } catch (error: Exception) {
             post(LanEvent.Error("收到无效对局消息：${error.userMessage()}"))
@@ -288,11 +322,18 @@ class LanMultiplayerManager(context: Context) {
 
     private fun send(message: JSONObject) {
         val socket = peerSocket ?: return
-        executor.execute {
+        val payload = JSONObject(message.toString())
+        synchronized(writeLock) {
+            payload.put("protocol", PROTOCOL_VERSION)
+            payload.put("sessionId", connectionSessionId)
+            payload.put("sequence", ++nextSequence)
+        }
+        sendExecutor.execute {
             try {
                 synchronized(writeLock) {
-                    val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-                    writer.write(message.toString())
+                    if (peerSocket !== socket || closedByUser) return@execute
+                    val writer = peerWriter ?: throw IllegalStateException("发送通道未建立")
+                    writer.write(payload.toString())
                     writer.newLine()
                     writer.flush()
                 }
@@ -320,10 +361,18 @@ class LanMultiplayerManager(context: Context) {
         val socket = peerSocket
         if (expected != null && socket !== expected) return
         peerSocket = null
+        peerWriter = null
         try {
             socket?.close()
         } catch (_: Exception) {
         }
+    }
+
+    private fun resetProtocolState() {
+        connectionSessionId = UUID.randomUUID().toString()
+        activePeerSessionId = null
+        lastReceivedSequence = 0L
+        synchronized(writeLock) { nextSequence = 0L }
     }
 
     private fun emitRooms() = post(LanEvent.RoomsChanged(roomsByServiceName.values.sortedBy { it.serviceName }))
@@ -340,10 +389,15 @@ class LanMultiplayerManager(context: Context) {
     private companion object {
         const val SERVICE_TYPE = "_gomoku-android._tcp."
         const val CONNECT_TIMEOUT_MS = 5_000
+        const val PROTOCOL_VERSION = 2
+        const val MAX_MESSAGE_LENGTH = 4096
+        const val TYPE_HELLO = "hello"
         const val TYPE_JOIN = "join"
         const val TYPE_START = "start"
         const val TYPE_MOVE = "move"
         const val TYPE_PAUSE = "pause"
         const val TYPE_LEAVE = "leave"
     }
+
+    @Volatile private var nextSequence: Long = 0L
 }

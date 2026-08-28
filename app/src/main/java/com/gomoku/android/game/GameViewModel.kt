@@ -73,6 +73,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     private val ai = GomokuAi()
     private val lanManager = LanMultiplayerManager(application.applicationContext)
     private var aiJob: Job? = null
+    private var lastRemoteSequence = 0L
 
     var uiState = androidx.compose.runtime.mutableStateOf(GameUiState())
         private set
@@ -155,6 +156,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     /** 结束对局并回到对应模式的开始页；局域网对局会同时断开房间。 */
     fun endMatch() {
         val state = uiState.value
+        lastRemoteSequence = 0L
         aiJob?.cancel()
         if (state.mode == GameMode.LAN) {
             lanManager.leave()
@@ -194,6 +196,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     fun hostRoom() {
         val state = uiState.value
         if (state.mode != GameMode.LAN) return
+        lastRemoteSequence = 0L
         val reset = state.copy(
             board = GomokuRules.createBoard(),
             history = emptyList(),
@@ -220,6 +223,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     fun joinRoom(room: LanRoom) {
         val state = uiState.value
         if (state.mode != GameMode.LAN) return
+        lastRemoteSequence = 0L
         uiState.value = state.copy(
             board = GomokuRules.createBoard(),
             history = emptyList(),
@@ -273,6 +277,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun startLanMatch(state: GameUiState) {
         if (!state.lan.isConnected || state.lan.role != LanRole.HOST) return
+        lastRemoteSequence = 0L
         val hostPlayer = randomPlayer()
         val fresh = state.copy(
             board = GomokuRules.createBoard(),
@@ -391,6 +396,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
             )
             is LanEvent.MatchStarted -> {
                 if (state.lan.role != LanRole.GUEST) return
+                lastRemoteSequence = 0L
                 val guestPlayer = GomokuRules.opponent(event.hostPlayer)
                 uiState.value = state.copy(
                     board = GomokuRules.createBoard(),
@@ -406,6 +412,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
             }
             is LanEvent.RemoteMoveReceived -> {
                 if (state.mode != GameMode.LAN || !state.lan.isConnected || !state.isMatchPlaying) return
+                if (event.sequence <= lastRemoteSequence) return
                 val remotePlayer = GomokuRules.opponent(state.localPlayer)
                 if (event.move.player != remotePlayer || event.move.player != state.currentPlayer ||
                     !GomokuRules.isEmpty(state.board, event.move.row, event.move.col)
@@ -413,6 +420,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
                     uiState.value = state.copy(lan = state.lan.copy(message = "收到异常落子，已忽略"))
                     return
                 }
+                lastRemoteSequence = event.sequence
                 applyMove(event.move, sendToPeer = false)
             }
             is LanEvent.PauseChanged -> {
@@ -422,10 +430,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
                     lan = state.lan.copy(message = if (event.paused) "对手暂停了对局" else "对手恢复了对局"),
                 )
             }
-            LanEvent.PeerLeft -> uiState.value = state.copy(
+            LanEvent.PeerLeft -> {
+                lastRemoteSequence = 0L
+                uiState.value = state.copy(
                 phase = MatchPhase.SETUP,
                 lan = state.lan.copy(connection = LanConnectionState.IDLE, message = "对手已离开房间", rooms = emptyList()),
-            )
+                )
+            }
             is LanEvent.Error -> uiState.value = state.copy(
                 phase = MatchPhase.SETUP,
                 lan = state.lan.copy(connection = LanConnectionState.ERROR, message = event.reason),
