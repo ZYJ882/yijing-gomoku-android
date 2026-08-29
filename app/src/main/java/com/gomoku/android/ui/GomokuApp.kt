@@ -32,6 +32,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.MaterialTheme
@@ -41,6 +42,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -78,6 +80,7 @@ import com.gomoku.android.game.WHITE
 import com.gomoku.android.network.LanConnectionState
 import com.gomoku.android.network.LanRoom
 import kotlin.math.abs
+import java.util.Locale
 import kotlin.math.min
 
 private val Ink = Color(0xFF12213A)
@@ -528,7 +531,13 @@ private fun GameStatusCard(state: GameUiState) {
                 Text(title, color = Color.White, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(subtitle, color = Color(0xFFB8C5D7), style = MaterialTheme.typography.bodySmall)
             }
-            if (state.mode == GameMode.AI && state.aiNodes > 0) {
+            if (state.isAiThinking) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(24.dp),
+                    color = Accent,
+                    strokeWidth = 2.5.dp,
+                )
+            } else if (state.mode == GameMode.AI && state.aiNodes > 0) {
                 Column(horizontalAlignment = Alignment.End) {
                     Text("深度 ${state.aiDepth}", color = Accent, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
                     Text("${formatNodes(state.aiNodes)} 节点", color = Muted, style = MaterialTheme.typography.labelSmall)
@@ -694,12 +703,21 @@ private fun GomokuTextFieldColors() = OutlinedTextFieldDefaults.colors(
 private fun pieceName(player: Int): String = if (player == BLACK) "黑" else "白"
 
 private fun formatNodes(nodes: Int): String = when {
-    nodes >= 10_000 -> String.format("%.1f万", nodes / 10_000f)
-    nodes >= 1_000 -> String.format("%.1fk", nodes / 1_000f)
+    nodes >= 10_000 -> String.format(Locale.US, "%.1f万", nodes / 10_000f)
+    nodes >= 1_000 -> String.format(Locale.US, "%.1fk", nodes / 1_000f)
     else -> nodes.toString()
 }
 
 @Composable
 private fun GomokuTheme(content: @Composable () -> Unit) {
-    MaterialTheme(content = content)
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            primary = Accent,
+            onPrimary = Ink,
+            background = Night,
+            surface = Color(0xFF162843),
+            onSurface = Color.White,
+        ),
+        content = content,
+    )
 }

@@ -16,8 +16,9 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
-import java.util.concurrent.ExecutorService
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
@@ -33,7 +34,7 @@ class LanMultiplayerManager(context: Context) {
     private val executor: ExecutorService = Executors.newCachedThreadPool()
     private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val writeLock = Any()
-    private val roomsByServiceName = linkedMapOf<String, LanRoom>()
+    private val roomsByServiceName = ConcurrentHashMap<String, LanRoom>()
     private val resolvingServices = mutableSetOf<String>()
 
     @Volatile private var serverSocket: ServerSocket? = null
@@ -42,12 +43,16 @@ class LanMultiplayerManager(context: Context) {
     @Volatile private var isDiscovering = false
     @Volatile private var isRegistered = false
     @Volatile private var closedByUser = false
-    private var advertisedServiceName: String? = null
-    private var registrationListener: NsdManager.RegistrationListener? = null
-    private var discoveryListener: NsdManager.DiscoveryListener? = null
-    private var connectionSessionId: String = UUID.randomUUID().toString()
+    @Volatile private var advertisedServiceName: String? = null
+    @Volatile private var registrationListener: NsdManager.RegistrationListener? = null
+    @Volatile private var discoveryListener: NsdManager.DiscoveryListener? = null
+    @Volatile private var connectionSessionId: String = UUID.randomUUID().toString()
     @Volatile private var activePeerSessionId: String? = null
     @Volatile private var lastReceivedSequence: Long = 0L
+    @Volatile private var nextSequence: Long = 0L
+    private val incomingRateLock = Any()
+    private var incomingWindowStartMs = 0L
+    private var incomingMessageCount = 0
 
     var eventListener: (LanEvent) -> Unit = {}
 
@@ -69,6 +74,7 @@ class LanMultiplayerManager(context: Context) {
                     return@execute
                 }
                 peerSocket = accepted
+                peerWriter = BufferedWriter(OutputStreamWriter(accepted.getOutputStream(), Charsets.UTF_8))
                 startReader(accepted)
                 postState(LanConnectionState.CONNECTED, LanRole.HOST, "玩家已加入，你执黑棋先手")
                 post(LanEvent.PeerJoined)
@@ -227,14 +233,12 @@ class LanMultiplayerManager(context: Context) {
 
     private fun unregisterRoom() {
         val listener = registrationListener ?: return
-        if (isRegistered) {
-            try {
-                nsdManager.unregisterService(listener)
-            } catch (_: Exception) {
-            }
-        }
-        isRegistered = false
         registrationListener = null
+        isRegistered = false
+        try {
+            nsdManager.unregisterService(listener)
+        } catch (_: Exception) {
+        }
     }
 
     private fun resolveRoom(serviceInfo: NsdServiceInfo) {
@@ -283,6 +287,11 @@ class LanMultiplayerManager(context: Context) {
 
     private fun handleIncoming(raw: String) {
         try {
+            if (!allowIncomingMessage()) {
+                closePeerOnly()
+                post(LanEvent.Error("消息频率过高，连接已断开"))
+                return
+            }
             if (raw.length > MAX_MESSAGE_LENGTH) throw IllegalArgumentException("消息过长")
             val message = JSONObject(raw)
             if (message.optInt("protocol", -1) != PROTOCOL_VERSION) {
@@ -369,10 +378,28 @@ class LanMultiplayerManager(context: Context) {
     }
 
     private fun resetProtocolState() {
-        connectionSessionId = UUID.randomUUID().toString()
+        synchronized(writeLock) {
+            connectionSessionId = UUID.randomUUID().toString()
+            nextSequence = 0L
+        }
         activePeerSessionId = null
         lastReceivedSequence = 0L
-        synchronized(writeLock) { nextSequence = 0L }
+        synchronized(incomingRateLock) {
+            incomingWindowStartMs = 0L
+            incomingMessageCount = 0
+        }
+    }
+
+    private fun allowIncomingMessage(): Boolean {
+        val now = System.currentTimeMillis()
+        synchronized(incomingRateLock) {
+            if (now - incomingWindowStartMs >= INCOMING_WINDOW_MS) {
+                incomingWindowStartMs = now
+                incomingMessageCount = 0
+            }
+            incomingMessageCount++
+            return incomingMessageCount <= MAX_INCOMING_MESSAGES_PER_WINDOW
+        }
     }
 
     private fun emitRooms() = post(LanEvent.RoomsChanged(roomsByServiceName.values.sortedBy { it.serviceName }))
@@ -391,6 +418,8 @@ class LanMultiplayerManager(context: Context) {
         const val CONNECT_TIMEOUT_MS = 5_000
         const val PROTOCOL_VERSION = 2
         const val MAX_MESSAGE_LENGTH = 4096
+        const val INCOMING_WINDOW_MS = 1_000L
+        const val MAX_INCOMING_MESSAGES_PER_WINDOW = 30
         const val TYPE_HELLO = "hello"
         const val TYPE_JOIN = "join"
         const val TYPE_START = "start"
@@ -399,5 +428,4 @@ class LanMultiplayerManager(context: Context) {
         const val TYPE_LEAVE = "leave"
     }
 
-    @Volatile private var nextSequence: Long = 0L
 }

@@ -1,6 +1,7 @@
 package com.gomoku.android.game
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.gomoku.android.ai.GomokuAi
@@ -304,7 +305,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         val status = calculateStatus(nextBoard, move)
         val nextPlayer = if (status == GameStatus.PLAYING) GomokuRules.opponent(move.player) else move.player
         val nextPhase = if (status == GameStatus.PLAYING) MatchPhase.PLAYING else MatchPhase.FINISHED
-        uiState.value = state.copy(
+        val updated = state.copy(
             board = nextBoard,
             history = state.history + move,
             currentPlayer = nextPlayer,
@@ -312,8 +313,8 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
             phase = nextPhase,
             lastMove = move,
         )
+        uiState.value = updated
         if (sendToPeer) lanManager.sendMove(move)
-        val updated = uiState.value
         if (updated.mode == GameMode.AI && updated.status == GameStatus.PLAYING && updated.currentPlayer != updated.localPlayer) {
             uiState.value = updated.copy(isAiThinking = true, aiDepth = 0, aiNodes = 0)
             requestAiMove(nextBoard, GomokuRules.opponent(updated.localPlayer), updated.difficulty)
@@ -334,7 +335,8 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (_: Exception) {
+            } catch (error: Exception) {
+                Log.w("GomokuAi", "AI 计算失败，使用合法落子兜底", error)
                 null
             }
             ensureActive()
